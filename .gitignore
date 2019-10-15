@@ -106,3 +106,5 @@ venv.bak/
 # gym stuffs
 recording*
 /tmp
+tmp/
+
