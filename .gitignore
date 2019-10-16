@@ -108,3 +108,5 @@ recording*
 /tmp
 tmp/
 
+# vs code stuffs
+.vscode/
