@@ -116,7 +116,7 @@ def save_state_images(frame_idx, states, net, device="cpu", max_states=200):
         ofs += batch_size
         if ofs >= max_states:
             break
-# %%
+#%%
 def save_transition_images(batch_size, predicted, projected, next_distr, dones, rewards, save_prefix):
     for batch_idx in range(batch_size):
         is_done = dones[batch_idx]
@@ -128,4 +128,37 @@ def save_transition_images(batch_size, predicted, projected, next_distr, dones, 
         plt.title("Predicted")
         plt.subplot(3, 1, 2)
         plt.bar(p, projected[batch_idx], width=0.5)
-        
+        plt.title("Projected")
+        plt.subplot(3, 1, 3)
+        plt.bar(p, next_distr[batch_idx], width=0.5)
+        plt.title("Next state")
+        suffix = ""
+        if reward != 0.0:
+            suffix = suffix + "_%.0f" % reward
+        if is_done:
+            suffix = suffix + "_done"
+        plt.savefig("%s_%02d%s.png" % (save_prefix, batch_idx, suffix))
+# %%
+def calc_loss(batch, net, tgt_net, gamma, device="cpu", save_prefix=None):
+    states, actions, rewards, dones, next_states = common.unpack_batch(batch)
+    batch_size = len(batch)
+
+    states_v = torch.tensor(states).to(device)
+    actions_v = torch.tensor(actions).to(device)
+    next_states_v = torch.tensor(next_states).to(device)
+
+    # next state distribution
+    next_distr_v, next_qvals_v = tgt_net.both(next_states_v)
+    next_actions = next_qvals_v.max(1)[1].data.cpu().numpy()
+    next_distr = tgt_net.apply_softmax(next_distr_v).data.cpu().numpy()
+
+    next_best_distr = next_distr[range(batch_size), next_actions]
+    dones = dones.astype(np.bool)
+
+    # project our distribution using Bellam update
+    proj_distr = common.distr_projection(next_best_distr, rewards, dones, Vmin, Vmax, N_ATOMS, gamma)
+
+    # calculate net output
+    distr_v = net(states_v)
+    state_action_values = distr_v[range(batch_size), actions_v.data]
+    state_log_sm_v = F.log_softmax(state_action_values, dim=1)
