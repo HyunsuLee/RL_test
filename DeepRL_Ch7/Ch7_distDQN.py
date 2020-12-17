@@ -23,6 +23,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 
 import tensorflow as tf
+import datetime
 
 from lib import common
 #%%
@@ -79,7 +80,7 @@ class DistributionalDQN(nn.Module):
     def both(self, x):
         cat_out = self(x)
         probs = self.apply_softmax(cat_out)
-        weigths = probs * self.supports 
+        weights = probs * self.supports 
         res = weights.sum(dim=2)
         return cat_out, res
 
@@ -87,7 +88,7 @@ class DistributionalDQN(nn.Module):
         return self.both(x)[1]
 
     def apply_softmax(self, t):
-        return self.softmax(t.view(-1))
+        return self.softmax(t.view(-1, N_ATOMS)).view(t.size())
 
 #%%
 def calc_values_of_states(states, net, device="cpu"):
@@ -120,7 +121,7 @@ def save_state_images(frame_idx, states, net, device="cpu", max_states=200):
 def save_transition_images(batch_size, predicted, projected, next_distr, dones, rewards, save_prefix):
     for batch_idx in range(batch_size):
         is_done = dones[batch_idx]
-        rewards = rewards[batch_idx]
+        reward = rewards[batch_idx]
         plt.clf()
         p = np.arange(Vmin, Vmax + DELTA_Z, DELTA_Z)
         plt.subplot(3, 1, 1)
@@ -162,3 +163,89 @@ def calc_loss(batch, net, tgt_net, gamma, device="cpu", save_prefix=None):
     distr_v = net(states_v)
     state_action_values = distr_v[range(batch_size), actions_v.data]
     state_log_sm_v = F.log_softmax(state_action_values, dim=1)
+    proj_distr_v = torch.tensor(proj_distr).to(device)
+
+    if save_prefix is not None:
+        pred = F.softmax(state_action_values, dim=1).data.cpu().numpy()
+        save_transition_images(batch_size, pred, proj_distr, next_best_distr, dones, rewards, save_prefix)
+
+    loss_v = -state_log_sm_v * proj_distr_v
+    return loss_v.sum(dim=1).mean()
+
+# %%
+if __name__ == "__main__":
+    params = common.HYPERPARAMS['pong']
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--cuda", default=True, action="store_true", help="Enable cuda")
+    args = parser.parse_args()
+    device = torch.device("cuda" if args.cuda else "cpu")
+
+    env = gym.make(params['env_name'])
+    env = ptan.common.wrappers.wrap_dqn(env)
+
+    current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S") # it's convenient to record the date with current time
+    LOGDIR = './tmp/ch7' + params['run_name'] + '/' + current_time + '/' 
+    writer = tf.summary.create_file_writer(LOGDIR)
+
+    net = DistributionalDQN(env.observation_space.shape, env.action_space.n).to(device)
+
+    tgt_net = ptan.agent.TargetNet(net)
+    selector = ptan.actions.EpsilonGreedyActionSelector(epsilon=params['epsilon_start'])
+    epsilon_tracker = common.EpsilonTracker(selector, params)
+    agent = ptan.agent.DQNAgent(lambda x: net.qvals(x), selector, device=device)
+
+    exp_source = ptan.experience.ExperienceSourceFirstLast(env, agent, gamma=params['gamma'], steps_count=1)
+    buffer = ptan.experience.ExperienceReplayBuffer(exp_source, buffer_size=params['replay_size'])
+    optimizer = optim.Adam(net.parameters(), lr=params['learning_rate'])
+
+    frame_idx = 0
+    eval_states = None
+    prev_save = 0
+    save_prefix = None
+
+    with common.RewardTracker(writer, params['stop_reward']) as reward_tracker:
+        while True:
+            frame_idx += 1
+            buffer.populate(1)
+            epsilon_tracker.frame(frame_idx)
+
+            new_rewards = exp_source.pop_total_rewards()
+            if new_rewards:
+                if reward_tracker.reward(new_rewards[0], frame_idx, selector.epsilon):
+                    break
+
+            if len(buffer) < params['replay_initial']:
+                continue
+
+            if eval_states is None:
+                eval_states = buffer.sample(STATES_TO_EVALUATE)
+                eval_states = [np.array(transition.state, copy=False) for transition in eval_states]
+                eval_states = np.array(eval_states, copy=False)
+
+            optimizer.zero_grad()
+            batch = buffer.sample(params['batch_size'])
+
+            save_prefix = None
+            if SAVE_TRANSTIONS_IMG:
+                interesting = any(map(lambda s: s.last_state is None or s.reward != 0.0, batch))
+                if interesting and frame_idx // 30000 > prev_save:
+                    save_prefix = "image/img_%08d" % frame_idx
+                    prev_save = frame_idx // 30000
+
+            loss_v = calc_loss(batch, net, tgt_net.target_model, gamma=params['gamma'], device=device, save_prefix=save_prefix)
+            loss_v.backward()
+            optimizer.step()
+
+            if frame_idx % params['target_net_sync'] == 0:
+                tgt_net.sync()
+
+            if frame_idx % EVAL_EVERY_FRAME == 0:
+                mean_val = calc_values_of_states(eval_states, net, device=device)
+                with writer.as_default():
+                    tf.summary.scalar("value_mean", mean_val, frame_idx)
+
+            if SAVE_STATES_IMG and frame_idx % 10000 == 0:
+                save_state_images(frame_idx, eval_states, net, device=device)
+        
+
+    
